@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowUpDown,
   ChevronRight,
@@ -56,6 +56,22 @@ type Listing = {
 
 type Sort = "name" | "size" | "date" | "type";
 
+/**
+ * How many rows the table materialises at once.
+ *
+ * A Pterodactyl folder can hold thousands of entries (node_modules, a log dump,
+ * an uploaded archive root). Every row is three icon buttons plus a checkbox and
+ * a badge — around thirty DOM nodes — and the whole table was previously built
+ * on the first render. On a phone that burst is what gets the renderer killed
+ * ("Aw, Snap!"), because the tab has to lay out and paint all of it in one frame
+ * while the previous page is still in memory.
+ *
+ * Rendering a page at a time keeps the node count flat: 150 rows is about 4,500
+ * nodes, which every device can hold, and `Show more` adds the next page on an
+ * interaction instead of during hydration.
+ */
+const ROW_PAGE = 150;
+
 function FilesView() {
   const router = useRouter();
   const params = useSearchParams();
@@ -70,6 +86,8 @@ function FilesView() {
   const [busy, setBusy] = useState<string | null>(null);
   const [syncPulse, setSyncPulse] = useState(0);
   const [importOpen, setImportOpen] = useState(false);
+  /** How many pages of `ROW_PAGE` rows are materialised. */
+  const [rowPage, setRowPage] = useState(1);
 
   const [dialog, setDialog] = useState<
     | null
@@ -106,6 +124,15 @@ function FilesView() {
       return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
     });
   }, [listing.data, filter, sort]);
+
+  const visibleEntries = useMemo(() => entries.slice(0, rowPage * ROW_PAGE), [entries, rowPage]);
+  const hiddenCount = Math.max(0, entries.length - visibleEntries.length);
+
+  // A different folder, filter or sort order is a different list — start over
+  // from the first page instead of keeping a window that no longer means anything.
+  useEffect(() => {
+    setRowPage(1);
+  }, [listing.data?.path, filter, sort]);
 
   /**
    * Tell the shared GitHub engine what just changed on the panel.
@@ -272,7 +299,7 @@ function FilesView() {
                     </td>
                   </tr>
                 )}
-                {entries.map((entry) => (
+                {visibleEntries.map((entry) => (
                   <tr key={entry.path} className="table-row cv-auto">
                     <td className="px-3 py-2">
                       <input type="checkbox" checked={selected.has(entry.path)} onChange={() => toggle(entry.path)} />
@@ -329,6 +356,18 @@ function FilesView() {
       <p className="mt-2 text-[11px] text-slate-600">
         {listing.data ? `${listing.data.counts.files} files · ${listing.data.counts.folders} folders · ${listing.data.counts.secrets} protected` : ""}
       </p>
+
+      {hiddenCount > 0 && (
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-ink-700/60 bg-ink-900/40 px-3 py-2 text-[11px] text-slate-400">
+          <span>
+            Showing {visibleEntries.length} of {entries.length} entries. The rest load a page at a time so a
+            large folder cannot crash the browser on a phone.
+          </span>
+          <button className="btn-ghost !py-1 text-[11px]" onClick={() => setRowPage((value) => value + 1)}>
+            Show next {Math.min(ROW_PAGE, hiddenCount)}
+          </button>
+        </div>
+      )}
 
       {/* Create folder / file / rename / move */}
       <Modal

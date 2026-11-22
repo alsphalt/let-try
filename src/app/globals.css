@@ -993,6 +993,46 @@ html[data-doc-hidden="true"] .animate-pulse {
   .bb-orb-mist span {
     filter: blur(4px);
   }
+
+  /**
+   * The introduction halo is a rotating conic gradient under a 38px blur — a
+   * viewport-scale filter texture that is rebuilt on every launch, before the
+   * console has even painted. It is the heaviest paint in the app and it plays
+   * on every page, so a device that cannot allocate the layer dies during boot
+   * and Chrome shows "Aw, Snap!" with no page underneath.
+   *
+   * A plain radial gradient draws the same glow with no filter pass and no
+   * animation; the intro is a title card, not a showcase for the compositor.
+   */
+  .xmas-halo {
+    animation: none;
+    filter: none;
+    background: radial-gradient(
+      circle at 50% 45%,
+      rgba(109, 94, 252, 0.22),
+      rgba(243, 201, 107, 0.12) 42%,
+      rgba(224, 74, 95, 0.08) 62%,
+      transparent 72%
+    );
+  }
+
+  /* The wordmark still fades in, but without a 14px blur pass on phones. */
+  .xmas-brand {
+    animation-name: xmas-brand-in-lite;
+  }
+}
+
+@keyframes xmas-brand-in-lite {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+    letter-spacing: 0.42em;
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    letter-spacing: 0.22em;
+  }
 }
 
 /**
