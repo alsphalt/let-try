@@ -342,11 +342,19 @@ DARKNOTE_DB_POOL=1            # optional; 1 on serverless, 8 for a long-running 
 
 - `db/schema.sql` is the baseline (`0001_baseline`); every later change is a file in `db/migrations/`
   applied in filename order and recorded in `db_migrations` with a SHA-256 checksum.
-- Migrations run under a PostgreSQL advisory lock, so ten serverless instances cold-starting at once
-  cannot race.
-- The app **verifies** the registry on boot instead of migrating blindly. `DARKNOTE_DB_MIGRATE=never`
-  refuses to start with a pending migration (use that in production with a deploy step);
-  `DARKNOTE_DB_MIGRATE=always` restores the migrate-on-boot behaviour.
+- Migrations run under a **transaction-scoped** PostgreSQL advisory lock
+  (`pg_try_advisory_xact_lock`) taken on the same connection and inside the same transaction that
+  applies the DDL, so ten instances cold-starting at once cannot race *and* the gate cannot be
+  leaked: the server releases it at commit, at rollback, or when the backend dies.
+- The pending set is recomputed **inside** the gate, so an instance that waited finds the registry
+  already current and applies nothing.
+- **A request never migrates.** `DARKNOTE_DB_MIGRATE=auto` (default) applies pending files on boot
+  only where one long-running process owns the schema (local, a container, `next start`) and is
+  verify-only on a serverless platform in production. `verify` never applies; `never` refuses to
+  start while something is pending; `always` applies on boot for exactly one long-running instance.
+- Booting is cheap: the check is two read-only statements, and when nothing is pending no lock is
+  taken at all. A failed initialisation is remembered for `DARKNOTE_DB_RETRY_MS` (3 s) so a burst of
+  requests does not turn one bad boot into a stampede.
 - A database created by an older build (rows in `schema_migrations`, no `db_migrations`) is *adopted*:
   the baseline is recorded without re-running it, and later migrations are applied on top.
 - Editing a released numbered migration is refused (checksum drift). The baseline is the exception —
@@ -379,9 +387,10 @@ Pages Router `api/` directory; this app has no such files, so that setting would
 
 1. `DATABASE_URL` (pooled) + `DARKNOTE_SECRET` in *Project → Settings → Environment Variables*
    (Production **and** Preview).
-2. Add `npm run db:migrate` as a step in the build command, or run it once from your machine against
-   the production URL. Keep `DARKNOTE_DB_MIGRATE=never` in the runtime environment so a request never
-   starts a migration.
+2. Run `npm run db:migrate` once — as a step in the build command, or from your machine against the
+   production URL. Leave `DARKNOTE_DB_MIGRATE` unset (`auto`): on Vercel it verifies the registry and
+   never migrates from a request, so several instances cold-starting at once cannot start a schema
+   change. Use `verify` if you want that behaviour stated explicitly.
 3. Verify with `GET /api/health`: it returns `200` only when the database answers, the backup store is
    writable and no migration is pending; otherwise `503` with the reason (`databaseError`).
 4. Uploads and backups live on the local filesystem, which is **ephemeral on Vercel**. Point

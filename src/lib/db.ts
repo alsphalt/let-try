@@ -30,6 +30,8 @@ export type { DbClient, DbConnection, DbKind, DbPoolStats, SqlParam } from './db
 interface Cache {
   client?: Promise<DbClient>;
   migrations?: MigrateResult | null;
+  /** Last failed initialisation, so a burst of requests does not retry it. */
+  failure?: { at: number; error: Error };
 }
 
 const globalCache = globalThis as unknown as { __darknoteDb?: Cache };
@@ -374,44 +376,110 @@ async function connect(): Promise<DbClient> {
 }
 
 /**
- * Migrations on boot.
+ * Schema policy at boot.
  *
- * A controlled deployment (Vercel build step, `npm run db:migrate`) should own
- * schema changes. Booting the app therefore *verifies* the registry by default
- * and only applies pending files when there is no deployment step — which is the
- * case for local runs and for a first install. `DARKNOTE_DB_MIGRATE=always`
- * forces the old behaviour, `never` makes a pending migration a startup error
- * instead of a silent half-schema.
+ * The rule the production outage taught: **a request must never migrate.**
+ *
+ *   - `always` — apply pending files on boot. Correct for a single long-running
+ *     process (`next start`, a container, a VPS) and for development.
+ *   - `auto` (default) — apply on boot where one process owns the schema, i.e.
+ *     a long-running server; **verify only** on a serverless platform in
+ *     production, because there every instance is a fresh process that would
+ *     otherwise try to migrate on its first request.
+ *   - `verify` — never apply; report pending files as a warning and in
+ *     `/api/health`. Pairs with `npm run db:migrate` in a deploy step.
+ *   - `never` — never apply, and treat a pending migration as a startup error
+ *     instead of serving against an unknown schema.
+ *
+ * Verification is two read-only statements (see `migrationStatus`), so it cannot
+ * hold a lock, create a table or block the login page.
  */
+export type MigrationMode = 'always' | 'auto' | 'verify' | 'never';
+
+export function migrationMode(): MigrationMode {
+  const raw = (process.env.DARKNOTE_DB_MIGRATE ?? '').trim().toLowerCase();
+  if (raw === 'always' || raw === 'verify' || raw === 'never') return raw;
+  return 'auto';
+}
+
+/** Vercel / Lambda / Netlify: a process per request, not a server. */
+function isServerlessRuntime(): boolean {
+  return (
+    process.env.VERCEL === '1' ||
+    Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) ||
+    Boolean(process.env.NETLIFY)
+  );
+}
+
+/** Does this process own the schema, or only read it? */
+export function mayMigrateOnBoot(): boolean {
+  const mode = migrationMode();
+  if (mode === 'always') return true;
+  if (mode === 'never' || mode === 'verify') return false;
+  return !(isServerlessRuntime() && env.isProd);
+}
+
 async function bootMigrations(client: DbClient): Promise<MigrateResult | null> {
   // CLI paths (db:migrate, db:backup, db:restore) own the schema themselves and
   // must be able to take a backup *before* anything is applied.
   if (process.env.DARKNOTE_NO_AUTO_MIGRATE === '1') return null;
-  const mode = (process.env.DARKNOTE_DB_MIGRATE ?? 'auto').toLowerCase();
+  if (mayMigrateOnBoot()) return migrate(client, { allowDrift: true });
+
+  const mode = migrationMode();
+  const status = await migrationStatus(client);
+  if (status.pending.length === 0) return null;
+
+  const detail = `The database has ${status.pending.length} pending migration(s): ${status.pending.join(', ')}.`;
   if (mode === 'never') {
-    const status = await migrationStatus(client).catch(() => null);
-    if (status && status.pending.length > 0) {
-      throw new Error(
-        `The database has ${status.pending.length} pending migration(s) (${status.pending.join(', ')}). Run \`npm run db:migrate\` before starting the app (DARKNOTE_DB_MIGRATE=never).`,
-      );
-    }
-    return null;
+    throw new Error(
+      `${detail} This deployment is configured with DARKNOTE_DB_MIGRATE=never, so it will not apply them: run \`npm run db:migrate\` once against this database and redeploy.`,
+    );
   }
-  return migrate(client, { allowDrift: mode !== 'strict' });
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[darknote] ${detail} Not applied here — a request never migrates. Run \`npm run db:migrate\` once from a single machine, or set DARKNOTE_DB_MIGRATE=always on exactly one long-running instance.`,
+  );
+  return null;
+}
+
+/**
+ * How long a failed initialisation is remembered.
+ *
+ * A burst of requests used to retry the whole thing — connect, verify, and
+ * (before this change) a 20 s attempt at the migration gate — once per request,
+ * which turned one bad boot into a stampede of connections and lock polls. A
+ * short window serves every request in that burst the same answer, and the
+ * database that comes back after an outage heals on the next attempt.
+ *
+ * `DARKNOTE_DB_RETRY_MS=0` disables the pause.
+ */
+function retryPauseMs(): number {
+  const raw = Number(process.env.DARKNOTE_DB_RETRY_MS ?? '');
+  return Number.isFinite(raw) && raw >= 0 ? raw : 3_000;
 }
 
 export function db(): Promise<DbClient> {
   if (!cache.client) {
+    const pause = retryPauseMs();
+    if (pause > 0 && cache.failure && Date.now() - cache.failure.at < pause) {
+      return Promise.reject(cache.failure.error);
+    }
+
     cache.client = (async () => {
       const client = await connect();
       try {
         cache.migrations = await bootMigrations(client);
+        cache.failure = undefined;
         return client;
       } catch (error) {
         // Do not cache a failed initialisation: the next request retries, and a
         // database that comes back after an outage heals without a redeploy.
         await client.close().catch(() => undefined);
         cache.client = undefined;
+        cache.failure = {
+          at: Date.now(),
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
         throw error;
       }
     })();
@@ -467,6 +535,7 @@ export async function closeDatabase(): Promise<void> {
   const pending = cache.client;
   cache.client = undefined;
   cache.migrations = undefined;
+  cache.failure = undefined;
   if (!pending) return;
   const client = await pending.catch(() => null);
   await client?.close();

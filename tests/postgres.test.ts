@@ -120,6 +120,12 @@ test('a failed transaction leaves nothing behind', { skip }, async () => {
 test('conversation history is paged newest-first and scoped to its conversation', { skip }, async () => {
   const { query } = await import('../src/lib/db.ts');
   const conversationId = `cnv_${Date.now()}`;
+  // bigbrother_conversations.user_id is a foreign key: the author has to exist.
+  await query(
+    `insert into admin_users (id, email, name, password_hash, role)
+     values ('usr_pg_test', 'paging@example.com', 'PG Test', 'x', 'owner')
+     on conflict (id) do nothing`,
+  );
   await query(
     `insert into bigbrother_conversations (id, user_id, title, message_count)
      values ($1, 'usr_pg_test', 'paging', 5) on conflict (id) do nothing`,
@@ -207,4 +213,103 @@ test('dbHealth reports the live server, not a cached verdict', { skip }, async (
   assert.ok((health.latencyMs ?? 1) >= 0);
   assert.equal(health.migrations.pending.length, 0);
   await closeDatabase();
+});
+
+/* ---------------------------------------------------------------------------
+   Advisory lock — the production outage of 2026-11-24.
+
+   The migration gate used to be `pg_try_advisory_lock` through a pooled
+   `client.query()`: the connection was returned to the pool while still holding
+   a session lock, the DDL ran on a different connection, and the unlock often
+   landed on a third. The result was two instances applying the baseline at once
+   (`pg_type_typname_nsp_index`), a lock leaked on an idle backend, and every
+   later boot failing after 20 s with "advisory lock held for 20s" — which is
+   what stopped the administrator from logging in.
+
+   These three tests fail against that implementation and pass against the
+   transaction-scoped one.
+   --------------------------------------------------------------------------- */
+
+test('a completed migration leaves no advisory lock behind', { skip }, async () => {
+  const { migrate, MIGRATION_LOCK_KEY } = await import('../src/lib/db/migrate.ts');
+  const { db, query } = await import('../src/lib/db.ts');
+  const client = await db();
+
+  await migrate(client, { allowDrift: true });
+
+  // pg_locks stores a 64-bit advisory key split across classid/objid (both oid),
+  // so compare the pair rather than the key.
+  const high = Math.floor(Number(MIGRATION_LOCK_KEY) / 2 ** 32);
+  const low = Number(MIGRATION_LOCK_KEY) % 2 ** 32;
+  const locks = await query<{ count: string | number }>(
+    `select count(*)::int as count from pg_locks
+      where locktype = 'advisory' and classid = $1::int and objid = $2::int`,
+    [high, low],
+  );
+  assert.equal(
+    Number(locks[0]?.count ?? -1),
+    0,
+    'the gate must be gone once the transaction ends — a leaked lock blocks every later boot',
+  );
+});
+
+test('the gate is exclusive for the life of its transaction, not its statement', { skip }, async () => {
+  const { Pool } = await import('pg');
+  const { MIGRATION_LOCK_KEY } = await import('../src/lib/db/migrate.ts');
+  const pool = new Pool({ connectionString: PG_URL, ssl: false, max: 2 });
+  const first = await pool.connect();
+  const second = await pool.connect();
+  const tryGate = async (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<{ locked: boolean }> }> }) =>
+    Boolean((await client.query('select pg_try_advisory_xact_lock($1::bigint) as locked', [MIGRATION_LOCK_KEY])).rows[0]?.locked);
+
+  try {
+    await first.query('begin');
+    assert.equal(await tryGate(first), true, 'the first session takes the gate');
+
+    await second.query('begin');
+    assert.equal(await tryGate(second), false, 'a second session must be refused while the first holds it');
+
+    // Commit of the holder must free it — this is what a pooled unlock could not
+    // guarantee, because it ran on whichever connection the pool handed back.
+    await first.query('commit');
+    assert.equal(await tryGate(second), true, 'the gate is free once the holder commits');
+    await second.query('rollback');
+  } finally {
+    first.release();
+    second.release();
+    await pool.end();
+  }
+});
+
+test('an interrupted migration does not leave the gate held', { skip }, async () => {
+  const { Pool } = await import('pg');
+  const { migrate, MIGRATION_LOCK_KEY } = await import('../src/lib/db/migrate.ts');
+  const { db } = await import('../src/lib/db.ts');
+
+  const pool = new Pool({ connectionString: PG_URL, ssl: false, max: 2 });
+  pool.on('error', () => undefined);
+  const doomed = await pool.connect();
+  const killer = await pool.connect();
+  // The kill is the point of the test: swallow the client-side error it raises.
+  doomed.on('error', () => undefined);
+  killer.on('error', () => undefined);
+  try {
+    // A deployment killed mid-migration: the transaction is open, the gate is
+    // held, and then the backend disappears.
+    await doomed.query('begin');
+    const pid = Number((await doomed.query('select pg_backend_pid() as pid')).rows[0]?.pid);
+    await doomed.query('select pg_try_advisory_xact_lock($1::bigint)', [MIGRATION_LOCK_KEY]);
+    await killer.query('select pg_terminate_backend($1::int)', [pid]);
+
+    // The next boot must not wait 15 s and fail: the server dropped the lock
+    // with the backend.
+    const client = await db();
+    const started = Date.now();
+    await migrate(client, { allowDrift: true });
+    assert.ok(Date.now() - started < 5_000, 'the next migration must start immediately, not time out');
+  } finally {
+    doomed.release(true);
+    killer.release();
+    await pool.end().catch(() => undefined);
+  }
 });
