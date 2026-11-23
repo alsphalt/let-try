@@ -21,6 +21,7 @@ import { AnswerBlockView, Prose } from "@/components/bigbrother/rich";
 import { TutorialManager } from "@/components/bigbrother/tutorial-manager";
 import { api, apiDelete, apiPost, errorMessage } from "@/lib/client";
 import type { AnswerAction, AnswerBlock, Citation } from "@/lib/bigbrother/shared";
+import { allowsDecorativeMotion, readRenderProfile } from "@/lib/perf/profile";
 
 type Conversation = {
   id: string;
@@ -195,6 +196,9 @@ function BigBrotherView() {
   useEffect(() => {
     const stored = window.localStorage.getItem("bb.anim");
     if (stored === "off") setAnim(false);
+    // `?profile=safe|reduced` is the device-wide diagnostic switch: it wins over
+    // the stored per-page preference, without overwriting it.
+    if (!allowsDecorativeMotion(readRenderProfile())) setAnim(false);
   }, []);
 
   useEffect(() => {

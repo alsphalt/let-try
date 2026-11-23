@@ -1065,3 +1065,27 @@ html[data-motion="reduced"] .bb-orb::after,
 html[data-motion="reduced"] .bb-orb-mist span {
   animation: none !important;
 }
+
+/* ==========================================================================
+   Diagnostic render profile — `?profile=safe` and `?profile=reduced`
+   --------------------------------------------------------------------------
+   The reversible switch used to find what makes a device slow, without
+   disabling a feature. It is applied to <html data-profile> by
+   `src/lib/perf/profile.ts` and remembered per device, so a phone can be put
+   into safe mode and left there while a problem is bisected:
+   `?profile=safe` → `?profile=reduced` → `?profile=full` to clear it.
+
+   Decorative motion is the only thing removed here. Every page still loads its
+   data once, on demand; nothing about the interface or the branding changes.
+   ========================================================================== */
+html[data-profile="safe"] *,
+html[data-profile="reduced"] * {
+  animation: none !important;
+}
+
+/* The orb is fixed, so its three blurred, endlessly drifting mist spans are
+   composited on top of every page for a motion most phones cannot resolve. */
+html[data-profile="safe"] .bb-orb-mist,
+html[data-profile="reduced"] .bb-orb-mist {
+  display: none;
+}

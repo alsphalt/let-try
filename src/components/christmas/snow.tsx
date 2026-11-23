@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { allowsDecorativeMotion, readRenderProfile } from "@/lib/perf/profile";
 
 /**
  * Falling snow on a single canvas.
@@ -8,7 +9,13 @@ import { useEffect, useRef } from "react";
  * Deliberately cheap: one canvas, one animation frame loop, a bounded particle
  * count that scales with the viewport, integer positions, no shadows, no
  * off-screen work. The loop stops when the tab is hidden, when the OS asks for
- * reduced motion, and when the component unmounts.
+ * reduced motion, when `?profile=safe`/`reduced` is set, and when the component
+ * unmounts.
+ *
+ * The loop is also capped at ~30 fps. It is a full-viewport overlay that sits
+ * above every page, so at 60 fps it kept the compositor and the GPU awake for a
+ * decoration nobody can see moving at that rate; halving the frames halves that
+ * cost with no visible difference on drifting flakes.
  */
 export function SnowLayer({ density = 1 }: { density?: number }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -19,6 +26,7 @@ export function SnowLayer({ density = 1 }: { density?: number }) {
     if (typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       return;
     }
+    if (!allowsDecorativeMotion(readRenderProfile())) return;
 
     const context = canvas.getContext("2d", { alpha: true });
     if (!context) return;
@@ -65,10 +73,20 @@ export function SnowLayer({ density = 1 }: { density?: number }) {
       }));
     };
 
+    /** ~30 fps. `last` is only advanced on a painted frame, so `delta` stays honest. */
+    const FRAME_MS = 33;
+
     const frame = (now: number) => {
       if (!active) return;
+      raf = window.requestAnimationFrame(frame);
+      if (now - last < FRAME_MS) return;
+
       const delta = last ? Math.min(48, now - last) : 16;
       last = now;
+
+      // Nothing to draw: the canvas is collapsed (`display: none`) or the
+      // viewport has no area. Keep the loop parked instead of painting.
+      if (width < 2 || height < 2) return;
 
       context.clearRect(0, 0, width, height);
       for (const flake of flakes) {
@@ -89,7 +107,6 @@ export function SnowLayer({ density = 1 }: { density?: number }) {
         context.fill();
       }
       context.globalAlpha = 1;
-      raf = window.requestAnimationFrame(frame);
     };
 
     const start = () => {

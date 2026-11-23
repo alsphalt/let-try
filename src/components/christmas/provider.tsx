@@ -3,6 +3,12 @@
 import dynamic from "next/dynamic";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { prefersReducedMotion, type ChristmasMode } from "./prefs";
+import {
+  applyRenderProfile,
+  allowsDecorativeMotion,
+  readRenderProfile,
+  type RenderProfile,
+} from "@/lib/perf/profile";
 
 /**
  * The DARKNOTE introduction.
@@ -47,11 +53,16 @@ export function ChristmasProvider({ children }: { children: React.ReactNode }) {
   const [introOpen, setIntroOpen] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [reduced, setReduced] = useState(false);
+  // `?profile=safe|reduced` — the diagnostic switch. Read on the client only.
+  const [profile, setProfile] = useState<RenderProfile>("full");
   const timer = useRef<number | null>(null);
 
   // Motion preference drives the presentation, never whether the intro exists.
   useEffect(() => {
-    setReduced(prefersReducedMotion());
+    const resolved = readRenderProfile();
+    setProfile(resolved);
+    applyRenderProfile(resolved);
+    setReduced(prefersReducedMotion() || !allowsDecorativeMotion(resolved));
   }, []);
 
   // One attribute pair drives every festive style.
@@ -104,7 +115,7 @@ export function ChristmasProvider({ children }: { children: React.ReactNode }) {
       {/* Installed apps paint this before hydration; it is display:none in a tab. */}
       <div className="xmas-boot" aria-hidden="true" />
       {children}
-      <SnowLayer />
+      {allowsDecorativeMotion(profile) ? <SnowLayer /> : null}
       {introOpen ? <ChristmasIntro leaving={leaving} onSkip={dismissIntro} /> : null}
     </ChristmasContext.Provider>
   );

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet, errorMessage } from "./client";
+import { allowsPolling, readRenderProfile } from '@/lib/perf/profile';
 
 /**
  * Cached, de-duplicated GET hook.
@@ -168,7 +169,11 @@ export function useApi<T>(
    * dropped on `hidden` and one fresh read runs when the page comes back.
    */
   useEffect(() => {
-    const every = options.refreshMs;
+    /**
+     * `?profile=safe` turns every background poll off for this device. The page
+     * already has its data from the mount read; this only stops the repeat.
+     */
+    const every = allowsPolling(readRenderProfile()) ? options.refreshMs : 0;
     if (!every || !url) return;
 
     let timer: ReturnType<typeof setInterval> | null = null;
