@@ -1,6 +1,87 @@
 # Darknote Control Center — build status
 
-Last updated: 2026-11-21 · branch `main`
+Last updated: 2026-11-23 · branch `main`
+
+## This pass — the advisory lock that stopped admin login, and a reversible cost switch
+
+Reported: login fails with *"The database did not initialise. Another process is running
+DARKNOTE migrations (advisory lock held for 20s)"*.
+
+### The lock was leaked, not busy
+
+`withAdvisoryLock()` took `pg_try_advisory_lock` through `client.query()`. That is a **pooled**
+call: the connection returns to the pool the moment the statement finishes, while still holding a
+**session**-scoped lock. Three things followed, and all three were visible in production:
+
+1. the DDL then ran on whichever connection the next pooled call picked, so the gate protected
+   nothing — two instances applied the baseline at once and one died with
+   `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`;
+2. the matching `pg_advisory_unlock` often landed on a *different* session, returned `false`, and
+   left the lock held by an idle pooled backend. Behind a transaction-mode pooler (Neon `-pooler`)
+   a client disconnect does not end the server session, so the lock never died;
+3. every later boot waited the full 20 s and threw, and because `db()` caches the client, each
+   request retried the whole thing — login returned 500 from then on.
+
+The migration was never stuck. The lock outlived the process that took it.
+
+### The repair (`src/lib/db/migrate.ts`, `src/lib/db.ts`)
+
+- `pg_try_advisory_xact_lock` on the **same connection, inside the same transaction** that applies
+  the DDL. PostgreSQL drops it at commit, at rollback, or when the backend dies, so it cannot leak
+  and it cannot be released on the wrong session. This is also the only form that is correct behind
+  a transaction-mode pooler.
+- A **new fixed lock key** (`7623980129843`). The legacy `hashtext('darknote_migrations')` key is
+  abandoned on production backends by the broken implementation; reusing it would mean waiting on a
+  lock nobody can release. Nothing needs to be unlocked by hand.
+- The pending set is recomputed **inside** the gate, so an instance that waited finds the registry
+  current and applies nothing. Jittered backoff replaces the fixed 250 ms poll.
+- `migrationStatus()` is now **read-only**. It used to call `ensureRegistry()` — `create table if not
+  exists` — so a health probe or a login could race two instances into DDL and fail on
+  `pg_type_typname_nsp_index`. Creating the registry belongs to the gate holder only.
+- **A request never migrates.** `DARKNOTE_DB_MIGRATE=auto` (default) applies pending files on boot
+  only where one long-running process owns the schema (local, container, `next start`) and is
+  verify-only on Vercel. `verify` / `never` / `always` behave as documented in `.env.example` and the
+  README.
+- Booting is cheap and failure is remembered: two read-only statements, and a failed initialisation
+  is served from cache for `DARKNOTE_DB_RETRY_MS` (3 s) instead of being retried by every request in
+  the burst.
+
+### The cost switch (`src/lib/perf/profile.ts`)
+
+`?profile=safe|reduced|full`, remembered per device (`dn.profile.v1`) and mirrored to
+`<html data-profile>`:
+
+- `safe` — no background polling, no ambient/snow animation, motion reduced. Every page still loads
+  its data once on demand;
+- `reduced` — no ambient/snow animation, polling stays;
+- `full` — unchanged default; visiting it clears the profile.
+
+It removes optional **continuous** cost — what an Android freeze is actually made of — and disables
+no feature. The snow overlay is not mounted, the three blurred drifting `bb-orb-mist` spans are
+`display: none`, and the snow loop is capped at ~30 fps and parks when the canvas has no area.
+
+### Verified here
+
+- `tsc --noEmit` clean; `next build` succeeds.
+- `npm test`: **177 tests, 166 pass, 0 fail, 11 skipped** (the PostgreSQL integration file skips
+  without a server).
+- Those 11 ran against a **real PostgreSQL 18.7** (`DARKNOTE_TEST_PG_URL`, embedded cluster):
+  **11/11 pass**, including three new ones — a completed migration leaves **0** advisory locks, the
+  gate is exclusive for its transaction (not its statement), and a `pg_terminate_backend` mid-run
+  does not leave the gate held.
+- Fresh database → `npm run db:migrate` applied `0001`–`0004`, 54 tables, `healthy: true`.
+- Production `next start` with `VERCEL=1` against that database: `/login` 200 in 6 ms, `/api/health`
+  `ok: true`, `migrations.pending: []`; **20 concurrent `/login` and 10 concurrent
+  `POST /api/auth/login` all 200**, an owner session issued and readable from the cookie, and
+  `pg_locks` held **0** advisory locks afterwards. No advisory-lock text in the server log.
+
+### Not verified here
+
+- A physical Samsung Galaxy A17 (and its PWA install) — no device access in this environment, so
+  the Android freeze is addressed by removing provable cost, not confirmed fixed on hardware.
+- A live Vercel deployment and the production Neon database — no Vercel/Neon credentials here. The
+  migration step must be run once against production (`npm run db:migrate`) before the new build
+  serves traffic.
 
 ## This pass — `db/schema.sql` resolution, build packaging, one honest correction
 
